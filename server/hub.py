@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Medic Model Hub v1.0.0 — one OpenAI-compatible API for every model.
+"""Medic Model Hub v1.1.0 — one OpenAI-compatible API for every model.
 
 POST /v1/chat/completions with {"model": ..., "messages": [...]} and the hub
 routes to the right provider behind the scenes. Keys live in one local .env
 that builds never touch.
 
-Backends: openai, anthropic, google (gemini). Only configured backends are
-advertised. stdlib only — no pip dependencies.
+Chat backends: openai, anthropic, google (gemini), perplexity (sonar).
+POST /v1/embeddings routes to OpenAI's embedding models for semantic search.
+Only configured backends are advertised. stdlib only — no pip dependencies.
 """
 import json
 import os
@@ -15,13 +16,14 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PORT = int(os.environ.get("PORT", "8090"))
 
 # ---------------------------------------------------------------- config ---
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+PERPLEXITY_KEY = os.environ.get("PERPLEXITY_API_KEY", "").strip()
 
 # model name (or alias) -> (backend, provider-native model id)
 ROUTES = {
@@ -31,9 +33,19 @@ ROUTES = {
     "claude-haiku-4-5-20251001": ("anthropic", "claude-haiku-4-5-20251001"),
     "gemini": ("google", "gemini-flash-latest"),
     "gemini-flash-latest": ("google", "gemini-flash-latest"),
+    "sonar": ("perplexity", "sonar"),
+    "sonar-pro": ("perplexity", "sonar-pro"),
 }
 
-BACKEND_KEYS = {"openai": OPENAI_KEY, "anthropic": ANTHROPIC_KEY, "google": GEMINI_KEY}
+# embedding model name (or alias) -> (backend, provider-native model id)
+EMBED_ROUTES = {
+    "embed": ("openai", "text-embedding-3-small"),
+    "text-embedding-3-small": ("openai", "text-embedding-3-small"),
+    "text-embedding-3-large": ("openai", "text-embedding-3-large"),
+}
+
+BACKEND_KEYS = {"openai": OPENAI_KEY, "anthropic": ANTHROPIC_KEY,
+                "google": GEMINI_KEY, "perplexity": PERPLEXITY_KEY}
 
 
 def configured_backends():
@@ -42,6 +54,10 @@ def configured_backends():
 
 def available_models():
     return [m for m, (b, _) in ROUTES.items() if BACKEND_KEYS[b]]
+
+
+def available_embedding_models():
+    return [m for m, (b, _) in EMBED_ROUTES.items() if BACKEND_KEYS[b]]
 
 
 # ------------------------------------------------------------- adapters ---
@@ -76,13 +92,13 @@ def split_messages(messages):
     return ("\n".join(system_parts) or None, chat)
 
 
-def openai_complete(model, system, chat, max_tokens, temperature):
+def _openai_shaped_complete(url, key, model, system, chat, max_tokens, temperature):
+    """Shared translation for OpenAI-shaped chat APIs (OpenAI, Perplexity)."""
     msgs = ([{"role": "system", "content": system}] if system else []) + chat
     payload = {"model": model, "messages": msgs, "temperature": temperature}
     if max_tokens:
         payload["max_tokens"] = max_tokens
-    status, body = _post("https://api.openai.com/v1/chat/completions", payload,
-                         {"Authorization": f"Bearer {OPENAI_KEY}"})
+    status, body = _post(url, payload, {"Authorization": f"Bearer {key}"})
     if status != 200:
         return status, None, body
     ch = body["choices"][0]
@@ -93,6 +109,17 @@ def openai_complete(model, system, chat, max_tokens, temperature):
         "prompt_tokens": usage.get("prompt_tokens", 0),
         "completion_tokens": usage.get("completion_tokens", 0),
     }, None
+
+
+def openai_complete(model, system, chat, max_tokens, temperature):
+    return _openai_shaped_complete("https://api.openai.com/v1/chat/completions",
+                                   OPENAI_KEY, model, system, chat, max_tokens, temperature)
+
+
+def perplexity_complete(model, system, chat, max_tokens, temperature):
+    # Sonar is OpenAI-compatible; temperature must stay within (0, 2).
+    return _openai_shaped_complete("https://api.perplexity.ai/chat/completions",
+                                   PERPLEXITY_KEY, model, system, chat, max_tokens, temperature)
 
 
 def anthropic_complete(model, system, chat, max_tokens, temperature):
@@ -147,7 +174,27 @@ def gemini_complete(model, system, chat, max_tokens, temperature):
     }, None
 
 
-ADAPTERS = {"openai": openai_complete, "anthropic": anthropic_complete, "google": gemini_complete}
+ADAPTERS = {"openai": openai_complete, "anthropic": anthropic_complete,
+            "google": gemini_complete, "perplexity": perplexity_complete}
+
+
+# ---------------------------------------------------- embedding adapter ---
+def openai_embed(model, inputs):
+    """inputs: str or list[str]. Returns (status, result, err)."""
+    payload = {"model": model, "input": inputs}
+    status, body = _post("https://api.openai.com/v1/embeddings", payload,
+                         {"Authorization": f"Bearer {OPENAI_KEY}"})
+    if status != 200:
+        return status, None, body
+    usage = body.get("usage", {})
+    return 200, {
+        "embeddings": [d["embedding"] for d in sorted(body.get("data", []),
+                                                      key=lambda d: d.get("index", 0))],
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+    }, None
+
+
+EMBED_ADAPTERS = {"openai": openai_embed}
 
 
 # ---------------------------------------------------------------- server ---
@@ -182,20 +229,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"ok": True, "version": VERSION, "backends": configured_backends()})
         elif self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [
-                {"id": m, "object": "model", "owned_by": b}
-                for m, (b, _) in ROUTES.items() if BACKEND_KEYS[b]]})
+            data = [{"id": m, "object": "model", "owned_by": b}
+                    for m, (b, _) in ROUTES.items() if BACKEND_KEYS[b]]
+            data += [{"id": m, "object": "model", "owned_by": b}
+                     for m, (b, _) in EMBED_ROUTES.items() if BACKEND_KEYS[b]]
+            self._json(200, {"object": "list", "data": data})
         else:
             self._json(404, {"error": "not found"})
 
-    def do_POST(self):
-        if self.path != "/v1/chat/completions":
-            self._json(404, {"error": "not found"})
-            return
-        body = self._read_json()
-        if body is None:
-            self._json(400, {"error": "invalid JSON body"})
-            return
+    def _chat_completions(self, body):
         model = body.get("model", "")
         messages = body.get("messages")
         if not model or not isinstance(messages, list) or not messages:
@@ -216,8 +258,8 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         try:
             status, result, err = ADAPTERS[backend](native_model, system, chat, max_tokens, temperature)
-        except Exception as e:
-            self._json(502, {"error": f"backend '{backend}' failed: {type(e).__name__}"})
+        except Exception:
+            self._json(502, {"error": f"backend '{backend}' failed"})
             return
         ms = int((time.time() - t0) * 1000)
         if status != 200:
@@ -239,6 +281,59 @@ class Handler(BaseHTTPRequestHandler):
                       "completion_tokens": result["completion_tokens"],
                       "total_tokens": total},
         })
+
+    def _embeddings(self, body):
+        model = body.get("model", "")
+        inputs = body.get("input")
+        valid_input = isinstance(inputs, str) or (
+            isinstance(inputs, list) and inputs
+            and all(isinstance(x, str) for x in inputs))
+        if not model or not valid_input:
+            self._json(400, {"error": "need 'model' and 'input' (string or non-empty string array)"})
+            return
+        route = EMBED_ROUTES.get(model)
+        if not route or not BACKEND_KEYS[route[0]]:
+            self._json(400, {"error": f"unknown or unconfigured embedding model '{model}'",
+                             "available": available_embedding_models()})
+            return
+        backend, native_model = route
+        t0 = time.time()
+        try:
+            status, result, err = EMBED_ADAPTERS[backend](native_model, inputs)
+        except Exception:
+            self._json(502, {"error": f"backend '{backend}' failed"})
+            return
+        ms = int((time.time() - t0) * 1000)
+        if status != 200:
+            detail = (err or {}).get("provider_error", "backend error")
+            self._json(502, {"error": f"backend '{backend}' returned {status}", "detail": detail})
+            return
+        print(f"embed model={model} backend={backend} n={len(result['embeddings'])} "
+              f"tokens={result['prompt_tokens']} {ms}ms", flush=True)
+        self._json(200, {
+            "object": "list",
+            "data": [{"object": "embedding", "index": i, "embedding": vec}
+                     for i, vec in enumerate(result["embeddings"])],
+            "model": model,
+            "usage": {"prompt_tokens": result["prompt_tokens"],
+                      "total_tokens": result["prompt_tokens"]},
+        })
+
+    def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            body = self._read_json()
+            if body is None:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            self._chat_completions(body)
+        elif self.path == "/v1/embeddings":
+            body = self._read_json()
+            if body is None:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            self._embeddings(body)
+        else:
+            self._json(404, {"error": "not found"})
 
 
 if __name__ == "__main__":
