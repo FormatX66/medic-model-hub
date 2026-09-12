@@ -1,8 +1,8 @@
-# Medic Model Hub v1.0.0
+# Medic Model Hub v1.1.0
 
 One OpenAI-compatible API for every model. Any model, script, or agent on
-this machine talks to the hub; the hub routes to GPT, Claude, or Gemini
-behind the scenes.
+this machine talks to the hub; the hub routes to GPT, Claude, Gemini, or
+Sonar behind the scenes — plus an embeddings endpoint for semantic search.
 
 ## Install (Windows)
 
@@ -39,8 +39,26 @@ Response is the standard OpenAI completion object (`choices[0].message.content`,
 | `gpt` / `gpt-4o-mini` | OpenAI | gpt-4o-mini |
 | `claude` / `claude-haiku-4-5-20251001` | Anthropic | claude-haiku-4-5-20251001 |
 | `gemini` / `gemini-flash-latest` | Google | gemini-flash-latest |
+| `sonar` / `sonar-pro` | Perplexity | sonar / sonar-pro (live web search) |
 
 Unknown or unconfigured models return 400 with the list of what's available.
+
+**POST** `http://localhost:8090/v1/embeddings` — OpenAI embeddings shape:
+
+```json
+{
+  "model": "embed",
+  "input": "text to embed (or an array of strings)"
+}
+```
+
+Response is the standard OpenAI embeddings object (`data[].embedding`,
+`usage`). Embedding models:
+
+| name | backend | native model |
+|---|---|---|
+| `embed` / `text-embedding-3-small` | OpenAI | text-embedding-3-small |
+| `text-embedding-3-large` | OpenAI | text-embedding-3-large |
 
 **GET** `/v1/models` — list enabled models.
 **GET** `/health` — `{"ok": true, "backends": {...}}`.
@@ -51,7 +69,7 @@ Unknown or unconfigured models return 400 with the list of what's available.
   to a network without adding some.
 - `stream: true` is rejected in v1; non-streaming only.
 - Keys are never logged. Provider errors are sanitized before returning.
-- Tests: `python3 tests/test_hub.py` (25 checks, no network or keys needed).
+- Tests: `python3 tests/test_hub.py` (41 checks, no network or keys needed).
 - The hub is a separate service from the Medic Bridge relay; they run side
   by side and don't depend on each other.
 
