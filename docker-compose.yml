@@ -9,3 +9,5 @@ services:
       - .env
     environment:
       PORT: 8090
+    volumes:
+      - ./data:/app/data  # QPU job ledger survives rebuilds
