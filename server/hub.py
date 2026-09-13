@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Medic Model Hub v1.1.0 — one OpenAI-compatible API for every model.
+"""Medic Model Hub v1.2.0 — one OpenAI-compatible API for every model.
 
 POST /v1/chat/completions with {"model": ..., "messages": [...]} and the hub
 routes to the right provider behind the scenes. Keys live in one local .env
@@ -7,7 +7,12 @@ that builds never touch.
 
 Chat backends: openai, anthropic, google (gemini), perplexity (sonar).
 POST /v1/embeddings routes to OpenAI's embedding models for semantic search.
+GET/POST /v1/qpu/* is the IBM Quantum gateway (backends, usage, job
+submit/poll/results/cancel) with hardware safety gates.
 Only configured backends are advertised. stdlib only — no pip dependencies.
+
+House rule: every provider API we integrate gets a hub adapter — the hub
+stays the single gateway on this machine.
 """
 import json
 import os
@@ -16,7 +21,9 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-VERSION = "1.1.0"
+import qpu
+
+VERSION = "1.2.0"
 PORT = int(os.environ.get("PORT", "8090"))
 
 # ---------------------------------------------------------------- config ---
@@ -226,14 +233,19 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} {self.command} {self.path} ->", *args, flush=True)
 
     def do_GET(self):
-        if self.path == "/health":
-            self._json(200, {"ok": True, "version": VERSION, "backends": configured_backends()})
-        elif self.path == "/v1/models":
+        path = self.path.split("?", 1)[0]
+        if path == "/health":
+            health = configured_backends()
+            health["qpu"] = qpu.configured()
+            self._json(200, {"ok": True, "version": VERSION, "backends": health})
+        elif path == "/v1/models":
             data = [{"id": m, "object": "model", "owned_by": b}
                     for m, (b, _) in ROUTES.items() if BACKEND_KEYS[b]]
             data += [{"id": m, "object": "model", "owned_by": b}
                      for m, (b, _) in EMBED_ROUTES.items() if BACKEND_KEYS[b]]
             self._json(200, {"object": "list", "data": data})
+        elif path == "/v1/qpu" or path.startswith("/v1/qpu/"):
+            self._qpu("GET", path.split("/")[3:], None)
         else:
             self._json(404, {"error": "not found"})
 
@@ -319,14 +331,68 @@ class Handler(BaseHTTPRequestHandler):
                       "total_tokens": result["prompt_tokens"]},
         })
 
+    def _qpu_out(self, status, result, err):
+        if status == 200:
+            self._json(200, result)
+            return
+        if isinstance(err, dict) and "provider_error" in err:
+            self._json(502, {"error": "qpu provider error",
+                             "detail": err["provider_error"]})
+            return
+        msg = err.get("error", "qpu error") if isinstance(err, dict) else str(err)
+        if status == 400 or "not configured" in msg:
+            self._json(400, {"error": msg})
+        else:
+            self._json(502, {"error": msg})
+
+    def _qpu(self, method, parts, body):
+        """Route /v1/qpu/* — the IBM Quantum gateway."""
+        if parts == []:
+            self._json(200, {"endpoints": [
+                "GET /v1/qpu/backends", "GET /v1/qpu/usage",
+                "POST /v1/qpu/jobs", "GET /v1/qpu/jobs/{id}",
+                "GET /v1/qpu/jobs/{id}/results", "POST /v1/qpu/jobs/{id}/cancel",
+            ], "configured": qpu.configured()})
+            return
+        if method == "GET" and parts == ["backends"]:
+            self._qpu_out(*qpu.backends())
+        elif method == "GET" and parts == ["usage"]:
+            self._qpu_out(*qpu.usage())
+        elif method == "POST" and parts == ["jobs"]:
+            if not isinstance(body, dict):
+                self._json(400, {"error": "need JSON body with 'backend', 'shots', 'params'"})
+                return
+            print(f"qpu submit backend={body.get('backend')} shots={body.get('shots')}",
+                  flush=True)
+            self._qpu_out(*qpu.submit_job(body.get("backend"), body.get("shots"),
+                                          body.get("params")))
+        elif method == "GET" and len(parts) == 2 and parts[0] == "jobs":
+            self._qpu_out(*qpu.job_get(parts[1]))
+        elif method == "GET" and len(parts) == 3 and parts[0] == "jobs" \
+                and parts[2] == "results":
+            self._qpu_out(*qpu.job_results(parts[1]))
+        elif method == "POST" and len(parts) == 3 and parts[0] == "jobs" \
+                and parts[2] == "cancel":
+            print(f"qpu cancel job={parts[1]}", flush=True)
+            self._qpu_out(*qpu.job_cancel(parts[1]))
+        else:
+            self._json(404, {"error": "not found"})
+
     def do_POST(self):
-        if self.path == "/v1/chat/completions":
+        path = self.path.split("?", 1)[0]
+        if path == "/v1/qpu" or path.startswith("/v1/qpu/"):
+            body = self._read_json()
+            if body is None:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            self._qpu("POST", path.split("/")[3:], body)
+        elif path == "/v1/chat/completions":
             body = self._read_json()
             if body is None:
                 self._json(400, {"error": "invalid JSON body"})
                 return
             self._chat_completions(body)
-        elif self.path == "/v1/embeddings":
+        elif path == "/v1/embeddings":
             body = self._read_json()
             if body is None:
                 self._json(400, {"error": "invalid JSON body"})
