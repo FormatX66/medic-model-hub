@@ -9,6 +9,7 @@ import urllib.error
 
 sys.path.insert(0, "server")
 import hub
+import qpu
 
 PASS, FAIL = 0, 0
 
@@ -180,6 +181,165 @@ st, b = req("POST", "/v1/embeddings", {"model": "embed", "input": "x"})
 check("embed unconfigured backend 400", st == 400 and "embed" not in b["available"])
 hub.BACKEND_KEYS["openai"] = "k1"
 srv.shutdown()
+
+# --- QPU adapter + HTTP tests (stubbed Runtime API, no network) ------------
+print("qpu:")
+import tempfile
+import os as _os
+
+qpu.API_KEY = ""  # start unconfigured
+qpu.BACKENDS = ["ibm_kingston", "ibm_fez"]
+qpu.MAX_SHOTS = 1024
+qpu.LEDGER_PATH = _os.path.join(tempfile.mkdtemp(), "ledger.json")
+
+rt_calls = []
+
+
+def fake_authed(method, path, payload=None, timeout=60):
+    if not qpu.configured():
+        return 0, None, {"error": "qpu not configured (IBM_QUANTUM_API_KEY missing)"}
+    rt_calls.append((method, path, payload))
+    if path == "/instances/usage":
+        return 200, {"usage_consumed_seconds": 12, "usage_remaining_seconds": 588,
+                     "usage_limit_seconds": 600, "usage_limit_reached": False}, None
+    if path == "/backends":
+        return 200, {"backends": [
+            {"backend_name": "ibm_kingston", "number_of_qubits": 156,
+             "status": {"operational": True, "pending_jobs": 3}}]}, None
+    if method == "POST" and path == "/jobs":
+        return 200, {"id": "job123", "status": "QUEUED"}, None
+    if path == "/jobs/job123":
+        return 200, {"id": "job123", "status": "DONE"}, None
+    if path == "/jobs/job123/results":
+        return 200, {"results": [{"data": {"counts": {"00": 100}}}]}, None
+    if method == "POST" and path == "/jobs/job123/cancel":
+        return 200, {"cancelled": True}, None
+    return 404, None, {"provider_error": {"message": "nope"}}
+
+
+qpu._authed = fake_authed
+
+s, r, e = qpu.submit_job("ibm_kingston", 256, [{"shots": 1}])
+check("qpu unconfigured submit blocked", s == 0 and "not configured" in e["error"])
+
+s, r, e = qpu.backends()
+check("qpu unconfigured backends blocked", s == 0 and r is None)
+
+qpu.API_KEY = "kq"
+s, r, e = qpu.backends()
+check("qpu backends slim", s == 200 and r["backends"][0]["name"] == "ibm_kingston"
+      and r["backends"][0]["qubits"] == 156 and r["backends"][0]["operational"] is True)
+
+s, r, e = qpu.usage()
+check("qpu usage passthrough", s == 200 and r["usage_remaining_seconds"] == 588)
+
+rt_calls.clear()
+s, r, e = qpu.submit_job("ibm_kingston", 256, [{"shots": 999, "circuit": "qasm..."}])
+check("qpu submit ok", s == 200 and r["job_id"] == "job123" and r["shots"] == 256)
+sent = [c for c in rt_calls if c[0] == "POST" and c[1] == "/jobs"][0][2]
+check("qpu submit program/tags", sent["program_id"] == "sampler" and sent["tags"] == ["medic-hub"])
+check("qpu submit shots normalized", sent["params"][0]["shots"] == 256)
+check("qpu submit checked quota first",
+      rt_calls[0][1] == "/instances/usage")
+with open(qpu.LEDGER_PATH, encoding="utf-8") as f:
+    ledger = json.load(f)
+check("qpu ledger appended", isinstance(ledger, list) and ledger[-1]["job_id"] == "job123"
+      and ledger[-1]["shots"] == 256)
+
+s, r, e = qpu.submit_job("ibm_bogus", 256, [{"shots": 256}])
+check("qpu backend allowlist enforced", s == 400 and "allowlist" in e["error"])
+
+s, r, e = qpu.submit_job("ibm_kingston", 99999, [{"shots": 1}])
+check("qpu shot cap enforced", s == 400 and "1024" in e["error"])
+
+s, r, e = qpu.submit_job("ibm_kingston", 0, [{"shots": 1}])
+check("qpu zero shots rejected", s == 400)
+
+s, r, e = qpu.submit_job("ibm_kingston", 256, "notalist")
+check("qpu params shape enforced", s == 400 and "params" in e["error"])
+
+s, r, e = qpu.submit_job("ibm_kingston", 256, [])
+check("qpu empty params rejected", s == 400)
+
+orig_usage = qpu.usage
+qpu.usage = lambda: (200, {"usage_limit_reached": True, "usage_remaining_seconds": 0}, None)
+n_before = len(rt_calls)
+s, r, e = qpu.submit_job("ibm_kingston", 256, [{"shots": 256}])
+check("qpu quota gate refuses submit", s == 400 and "limit reached" in e["error"]
+      and len(rt_calls) == n_before)  # no POST /jobs attempted
+qpu.usage = orig_usage
+
+s, r, e = qpu.job_get("job123")
+check("qpu job_get", s == 200 and r["status"] == "DONE")
+
+s, r, e = qpu.job_results("job123")
+check("qpu job_results raw", s == 200 and r["results"][0]["data"]["counts"]["00"] == 100)
+
+s, r, e = qpu.job_cancel("job123")
+check("qpu job_cancel", s == 200 and r["cancelled"] is True)
+
+s, r, e = qpu.job_get("missing")
+check("qpu provider 404 -> provider_error", s == 404 and "provider_error" in e)
+
+# HTTP layer with the real adapter wired in (Runtime API still stubbed)
+srv2 = hub.HTTPServer(("127.0.0.1", 18091), hub.Handler)
+threading.Thread(target=srv2.serve_forever, daemon=True).start()
+
+
+def req2(method, path, body=None):
+    r = urllib.request.Request(f"http://127.0.0.1:18091{path}",
+                               data=json.dumps(body).encode() if body is not None else None,
+                               headers={"Content-Type": "application/json"}, method=method)
+    try:
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+st, b = req2("GET", "/v1/qpu")
+check("GET /v1/qpu index", st == 200 and "GET /v1/qpu/backends" in b["endpoints"]
+      and b["configured"] is True)
+
+st, b = req2("GET", "/v1/qpu/backends")
+check("GET /v1/qpu/backends", st == 200 and b["backends"][0]["name"] == "ibm_kingston")
+
+st, b = req2("GET", "/v1/qpu/usage")
+check("GET /v1/qpu/usage", st == 200 and b["usage_remaining_seconds"] == 588)
+
+st, b = req2("POST", "/v1/qpu/jobs",
+             {"backend": "ibm_kingston", "shots": 256, "params": [{"shots": 5}]})
+check("POST /v1/qpu/jobs", st == 200 and b["job_id"] == "job123")
+
+st, b = req2("POST", "/v1/qpu/jobs",
+             {"backend": "ibm_bogus", "shots": 256, "params": [{"shots": 5}]})
+check("POST /v1/qpu/jobs bad backend 400", st == 400 and "allowlist" in b["error"])
+
+st, b = req2("POST", "/v1/qpu/jobs",
+             {"backend": "ibm_kingston", "shots": 99999, "params": [{"shots": 5}]})
+check("POST /v1/qpu/jobs over cap 400", st == 400 and "shots" in b["error"])
+
+st, b = req2("GET", "/v1/qpu/jobs/job123")
+check("GET /v1/qpu/jobs/{id}", st == 200 and b["status"] == "DONE")
+
+st, b = req2("GET", "/v1/qpu/jobs/job123/results")
+check("GET /v1/qpu/jobs/{id}/results", st == 200 and "results" in b)
+
+st, b = req2("POST", "/v1/qpu/jobs/job123/cancel", {})
+check("POST /v1/qpu/jobs/{id}/cancel", st == 200 and b["cancelled"] is True)
+
+st, b = req2("GET", "/v1/qpu/jobs/missing")
+check("GET /v1/qpu unknown job -> 502 sanitized", st == 502 and "detail" in b)
+
+st, b = req2("GET", "/v1/qpu/nope")
+check("GET /v1/qpu unknown path 404", st == 404)
+
+qpu.API_KEY = ""
+st, b = req2("GET", "/v1/qpu/backends")
+check("qpu unconfigured -> 400", st == 400 and "not configured" in b["error"])
+st, b = req2("GET", "/health")
+check("health reports qpu flag", st == 200 and b["backends"]["qpu"] is False)
+srv2.shutdown()
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
