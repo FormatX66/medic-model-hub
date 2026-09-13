@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Medic Model Hub — IBM Quantum (QPU) adapter, v1.2.0.
+"""Medic Model Hub — IBM Quantum (QPU) adapter, v1.2.2.
 
 Thin authenticated gateway to Qiskit Runtime on IBM Quantum Platform.
 The hub owns the credential (IBM_QUANTUM_API_KEY in .env), exchanges it
@@ -42,6 +42,13 @@ LEDGER_PATH = os.environ.get("QPU_LEDGER", "data/qpu_ledger.json")
 IAM_TOKEN_URL = "https://iam.cloud.ibm.com/identity/token"
 TOKEN_TTL = 3300  # refresh IAM bearer before its 1h expiry
 
+# Explicit client UA on every outbound call. urllib's default
+# ("Python-urllib/3.x") trips Cloudflare's bot check on IBM's API front
+# door (HTTP 403 on reads even with a valid IAM token); an honest
+# client-identifying UA passes. Bumped with the hub version.
+HUB_VERSION = "1.2.2"
+USER_AGENT = f"medic-model-hub/{HUB_VERSION}"
+
 _token = None
 _token_at = 0.0
 
@@ -71,7 +78,7 @@ def _api_base():
 def _http(method, url, payload=None, bearer=None, timeout=60):
     """(status, body_dict). Never raises on HTTP errors; network errors -> (0, ...)."""
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if data is not None:
         headers["Content-Type"] = "application/json"
     if bearer:
@@ -104,7 +111,8 @@ def _bearer():
     req = urllib.request.Request(
         IAM_TOKEN_URL, data=form,
         headers={"Content-Type": "application/x-www-form-urlencoded",
-                 "Accept": "application/json"},
+                 "Accept": "application/json",
+                 "User-Agent": USER_AGENT},
         method="POST",
     )
     try:

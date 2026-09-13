@@ -1,4 +1,4 @@
-# Medic Model Hub v1.2.0
+# Medic Model Hub v1.2.2
 
 One API for every model — and now, one API for the QPU too. Any model,
 script, or agent on this machine talks to the hub; the hub routes to GPT,
@@ -43,9 +43,22 @@ Response is the standard OpenAI completion object (`choices[0].message.content`,
 | `gpt` / `gpt-4o-mini` | OpenAI | gpt-4o-mini |
 | `claude` / `claude-haiku-4-5-20251001` | Anthropic | claude-haiku-4-5-20251001 |
 | `gemini` / `gemini-flash-latest` | Google | gemini-flash-latest |
-| `sonar` / `sonar-pro` | Perplexity | sonar / sonar-pro (live web search) |
+| `sonar` / `sonar-pro` | Perplexity | sonar / sonar-pro (grounded via the hub's free web search; see below) |
 
 Unknown or unconfigured models return 400 with the list of what's available.
+
+**POST** `http://localhost:8090/v1/web_search` — the hub's own free web search:
+
+```json
+{"query": "latest Richmond cycling news", "count": 5}
+```
+
+Returns `{"query", "source", "results": [{"title", "url", "snippet"}]}`.
+Uses the Brave Search API free tier (2,000 queries/month, no card) when
+`BRAVE_SEARCH_API_KEY` is set, otherwise DuckDuckGo's keyless Instant Answer
+API. Sonar calls use this for grounding by default — no Perplexity
+per-call search fee. Set `SONAR_WEB_SEARCH=1` to opt back into Perplexity's
+own `web_search` tool (billed per call) instead.
 
 **POST** `http://localhost:8090/v1/embeddings` — OpenAI embeddings shape:
 
@@ -125,7 +138,7 @@ New provider API → new hub adapter, not a one-off client. Pattern:
   to a network without adding some.
 - `stream: true` is rejected in v1; non-streaming only.
 - Keys are never logged. Provider errors are sanitized before returning.
-- Tests: `python3 tests/test_hub.py` (73 checks, no network or keys needed).
+- Tests: `python3 tests/test_hub.py` (118 checks, no network or keys needed).
 - The hub is a separate service from the Medic Bridge relay; they run side
   by side and don't depend on each other.
 

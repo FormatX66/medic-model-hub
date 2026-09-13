@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Medic Model Hub v1.2.0 — one OpenAI-compatible API for every model.
+"""Medic Model Hub v1.2.2 — one OpenAI-compatible API for every model.
 
 POST /v1/chat/completions with {"model": ..., "messages": [...]} and the hub
 routes to the right provider behind the scenes. Keys live in one local .env
 that builds never touch.
 
-Chat backends: openai, anthropic, google (gemini), perplexity (sonar).
-POST /v1/embeddings routes to OpenAI's embedding models for semantic search.
-GET/POST /v1/qpu/* is the IBM Quantum gateway (backends, usage, job
-submit/poll/results/cancel) with hardware safety gates.
-Only configured backends are advertised. stdlib only — no pip dependencies.
+Chat backends: openai, anthropic, google (gemini), perplexity (sonar, via
+Perplexity's Agent API). POST /v1/embeddings routes to OpenAI's embedding
+models for semantic search. GET/POST /v1/qpu/* is the IBM Quantum gateway
+(backends, usage, job submit/poll/results/cancel) with hardware safety gates.
+POST /v1/web_search is the hub's own free web search (Brave free tier, or
+keyless DuckDuckGo fallback) — Sonar uses it for grounding by default so no
+Perplexity per-call search fee is incurred. Only configured backends are
+advertised. stdlib only — no pip dependencies.
 
 House rule: every provider API we integrate gets a hub adapter — the hub
 stays the single gateway on this machine.
@@ -22,8 +25,9 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import qpu
+import websearch
 
-VERSION = "1.2.0"
+VERSION = "1.2.2"
 PORT = int(os.environ.get("PORT", "8090"))
 
 # ---------------------------------------------------------------- config ---
@@ -100,7 +104,7 @@ def split_messages(messages):
 
 
 def _openai_shaped_complete(url, key, model, system, chat, max_tokens, temperature):
-    """Shared translation for OpenAI-shaped chat APIs (OpenAI, Perplexity)."""
+    """Shared translation for OpenAI-shaped chat APIs (OpenAI)."""
     msgs = ([{"role": "system", "content": system}] if system else []) + chat
     payload = {"model": model, "messages": msgs, "temperature": temperature}
     if max_tokens:
@@ -123,10 +127,79 @@ def openai_complete(model, system, chat, max_tokens, temperature):
                                    OPENAI_KEY, model, system, chat, max_tokens, temperature)
 
 
-def perplexity_complete(model, system, chat, max_tokens, temperature):
-    # Sonar is OpenAI-compatible; temperature must stay within (0, 2).
-    return _openai_shaped_complete("https://api.perplexity.ai/chat/completions",
-                                   PERPLEXITY_KEY, model, system, chat, max_tokens, temperature)
+def sonar_paid_search_opt_in():
+    """True when the operator wants Perplexity's own (per-call-fee) search
+    tool on Sonar: SONAR_WEB_SEARCH=1 in the environment."""
+    return os.environ.get("SONAR_WEB_SEARCH", "0").strip() == "1"
+
+
+def _grounding_message(chat):
+    """Build a web-results context message from the last user turn, or None
+    when search fails/returns nothing (chat then proceeds ungrounded)."""
+    query = ""
+    for m in reversed(chat):
+        if m.get("role") == "user":
+            c = m.get("content")
+            query = c if isinstance(c, str) else ""
+            break
+    if not query.strip():
+        return None
+    status, results, _err = websearch.web_search(query, count=5)
+    if status != 200 or not results:
+        print(f"sonar grounding: web search unavailable (status {status}), "
+              f"proceeding ungrounded", flush=True)
+        return None
+    lines = ["Current web search results — use them to ground your answer:"]
+    for r in results:
+        lines.append(f"- {r['title']}\n  {r['url']}\n  {r['snippet']}")
+    return {"role": "user", "content": "\n".join(lines)}
+
+
+def perplexity_complete(model, system, chat, max_tokens, temperature,
+                        paid_search=None):
+    """Sonar via Perplexity's Agent API (Responses shape).
+
+    Perplexity deprecated /chat/completions for Sonar; the Agent API at
+    /v1/responses takes `model`, `input` (message array), `instructions`
+    (system prompt), `temperature`, `max_output_tokens`, and `tools`.
+
+    Search behavior: by default NO Perplexity tools are attached (their
+    `web_search` tool carries a per-call fee). Instead the hub grounds the
+    call itself — top free web_search results are prepended as context.
+    Set SONAR_WEB_SEARCH=1 (or pass paid_search=True) to restore
+    Perplexity's own web_search tool and skip hub grounding.
+    The hub's own /v1/chat/completions interface is unchanged.
+    """
+    opt_in = paid_search if paid_search is not None else sonar_paid_search_opt_in()
+    payload = {"model": model, "temperature": temperature}
+    if opt_in:
+        payload["input"] = chat
+        payload["tools"] = [{"type": "web_search"}]
+        payload["tool_choice"] = "auto"
+    else:
+        ground = _grounding_message(chat)
+        payload["input"] = ([ground] + list(chat)) if ground else chat
+    if system:
+        payload["instructions"] = system
+    if max_tokens:
+        payload["max_output_tokens"] = max_tokens
+    status, body = _post("https://api.perplexity.ai/v1/responses", payload,
+                         {"Authorization": f"Bearer {PERPLEXITY_KEY}"})
+    if status != 200:
+        return status, None, body
+    text = ""
+    for item in body.get("output", []):
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    text += part.get("text", "")
+    usage = body.get("usage", {})
+    return 200, {
+        "text": text,
+        "finish": "stop",
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+    }, None
 
 
 def anthropic_complete(model, system, chat, max_tokens, temperature):
@@ -237,6 +310,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             health = configured_backends()
             health["qpu"] = qpu.configured()
+            health["web_search"] = websearch.source()  # 'brave' or 'duckduckgo'
             self._json(200, {"ok": True, "version": VERSION, "backends": health})
         elif path == "/v1/models":
             data = [{"id": m, "object": "model", "owned_by": b}
@@ -378,6 +452,27 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
+    def _web_search(self, body):
+        """POST /v1/web_search — the hub's own free web search."""
+        query = body.get("query")
+        count = body.get("count", 5)
+        try:
+            count = max(1, min(int(count), 10))
+        except (TypeError, ValueError):
+            self._json(400, {"error": "'count' must be an integer 1-10"})
+            return
+        status, results, err = websearch.web_search(query, count)
+        if status == 400:
+            self._json(400, {"error": (err or {}).get("error", "bad request")})
+            return
+        if status != 200:
+            detail = (err or {}).get("provider_error", "search error")
+            self._json(502, {"error": f"web search returned {status}", "detail": detail})
+            return
+        print(f"web_search src={websearch.source()} n={len(results)}", flush=True)
+        self._json(200, {"query": query, "source": websearch.source(),
+                         "results": results})
+
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         if path == "/v1/qpu" or path.startswith("/v1/qpu/"):
@@ -398,6 +493,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "invalid JSON body"})
                 return
             self._embeddings(body)
+        elif path == "/v1/web_search":
+            body = self._read_json()
+            if body is None:
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            self._web_search(body)
         else:
             self._json(404, {"error": "not found"})
 
