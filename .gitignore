@@ -1,4 +1,5 @@
 # Keys live here and are never committed. Bundles never overwrite it.
 .env
+data/
 __pycache__/
 *.pyc
