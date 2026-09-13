@@ -1,8 +1,12 @@
-# Medic Model Hub v1.1.0
+# Medic Model Hub v1.2.0
 
-One OpenAI-compatible API for every model. Any model, script, or agent on
-this machine talks to the hub; the hub routes to GPT, Claude, Gemini, or
-Sonar behind the scenes — plus an embeddings endpoint for semantic search.
+One API for every model — and now, one API for the QPU too. Any model,
+script, or agent on this machine talks to the hub; the hub routes to GPT,
+Claude, Gemini, or Sonar behind the scenes, serves embeddings for semantic
+search, and gateways IBM Quantum hardware jobs through `/v1/qpu/*`.
+
+House rule: every provider API we integrate gets a hub adapter — the hub
+stays the single gateway on this machine. See "Adding a provider" below.
 
 ## Install (Windows)
 
@@ -61,7 +65,59 @@ Response is the standard OpenAI embeddings object (`data[].embedding`,
 | `text-embedding-3-large` | OpenAI | text-embedding-3-large |
 
 **GET** `/v1/models` — list enabled models.
-**GET** `/health` — `{"ok": true, "backends": {...}}`.
+**GET** `/health` — `{"ok": true, "backends": {...}}` (includes `"qpu"`).
+
+## QPU gateway (`/v1/qpu/*`)
+
+IBM Quantum hardware through the hub. Set `IBM_QUANTUM_API_KEY` (and
+`IBM_QUANTUM_CRN`) in `.env`; without them every `/v1/qpu/*` call returns
+400. The hub exchanges the key for a short-lived IAM token itself.
+
+| endpoint | what it does |
+|---|---|
+| `GET /v1/qpu/backends` | backends: name, qubits, operational, pending jobs |
+| `GET /v1/qpu/usage` | live quota: consumed / remaining / limit seconds |
+| `POST /v1/qpu/jobs` | submit a Sampler job: `{"backend", "shots", "params"}` |
+| `GET /v1/qpu/jobs/{id}` | job status |
+| `GET /v1/qpu/jobs/{id}/results` | raw results (counts) |
+| `POST /v1/qpu/jobs/{id}/cancel` | cancel a queued/running job |
+
+`params` is an array of SamplerV2 PUBs — serialize circuits with your own
+qiskit and hand the hub the params; the hub normalizes every PUB's `shots`
+to the validated `shots` value.
+
+Hardware safety gates (all checked before anything touches the QPU):
+
+- backend must be in the `QPU_BACKENDS` allowlist
+  (default: `ibm_kingston,ibm_fez,ibm_marrakesh`)
+- `1 <= shots <= QPU_MAX_SHOTS` (default 1024)
+- live quota check first: refuses when IBM reports the usage limit
+  reached or no time remaining
+- every submission is appended to `data/qpu_ledger.json` (audit trail,
+  survives rebuilds via the `./data` volume)
+
+QPU output is evidence, not authority: results come back raw, the hub never
+interprets them.
+
+```bash
+curl http://localhost:8090/v1/qpu/backends
+curl -X POST http://localhost:8090/v1/qpu/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"backend":"ibm_kingston","shots":256,"params":[{...pubs...}]}'
+```
+
+## Adding a provider
+
+New provider API → new hub adapter, not a one-off client. Pattern:
+
+1. New module in `server/` (stdlib only) owning the provider's auth,
+   request translation, and any safety gates.
+2. Route(s) wired in `hub.py` (`/v1/...`), advertised only when its key
+   is set in `.env`.
+3. Key + tuning knobs in `.env.example` (never overwrite a live `.env`).
+4. Tests in `tests/test_hub.py` that stub the provider's HTTP boundary —
+   no network, no keys.
+5. README section + version bump.
 
 ## Notes
 
@@ -69,7 +125,7 @@ Response is the standard OpenAI embeddings object (`data[].embedding`,
   to a network without adding some.
 - `stream: true` is rejected in v1; non-streaming only.
 - Keys are never logged. Provider errors are sanitized before returning.
-- Tests: `python3 tests/test_hub.py` (41 checks, no network or keys needed).
+- Tests: `python3 tests/test_hub.py` (73 checks, no network or keys needed).
 - The hub is a separate service from the Medic Bridge relay; they run side
   by side and don't depend on each other.
 
