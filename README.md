@@ -1,4 +1,4 @@
-# Medic Model Hub v1.2.2
+# Medic Model Hub v1.2.4
 
 One API for every model — and now, one API for the QPU too. Any model,
 script, or agent on this machine talks to the hub; the hub routes to GPT,
@@ -119,6 +119,63 @@ curl -X POST http://localhost:8090/v1/qpu/jobs \
   -d '{"backend":"ibm_kingston","shots":256,"params":[{...pubs...}]}'
 ```
 
+### Azure Quantum (`/v1/azure/*`)
+
+Same endpoint shape as `/v1/qpu/*` (backends, usage, jobs, results,
+cancel), backed by `server/azure_quantum.py`. Set
+`AZURE_QUANTUM_CONNECTION_STRING` plus the Entra service-principal vars
+(`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`) in `.env`;
+without them every `/v1/azure/*` call returns 400. The adapter never
+sends the connection-string API key — auth is Entra client-credentials,
+and the exact data-plane header semantics were never invented (see the
+module docstring).
+
+`POST /v1/azure/jobs` takes `{"backend", "shots", "params"}` where
+`params` is an object with `input_data`, `input_data_format`, and
+`container_sas_uri` (the caller supplies a container SAS URI; the hub
+uploads the serialized input as a blob, then creates the job).
+
+Safety gates (same as IBM, plus stricter defaults):
+
+- backend must be in the `AZURE_QUANTUM_TARGETS` allowlist — **empty by
+  default: submit refuses everything until the operator names targets**
+- `1 <= shots <= AZURE_QUANTUM_MAX_SHOTS` (default 1024)
+- live quota check first: refuses when utilization >= limit for the
+  job's provider
+- every submission is appended to `data/azure_qpu_ledger.json`
+
+### Google Quantum Engine (`/v1/google/*`)
+
+Same endpoint shape, backed by `server/google_quantum.py`. Set
+`GOOGLE_QUANTUM_PROJECT_ID` plus either `GOOGLE_QUANTUM_ACCESS_TOKEN`
+or the OAuth trio (`GOOGLE_QUANTUM_CLIENT_ID`,
+`GOOGLE_QUANTUM_CLIENT_SECRET`, `GOOGLE_QUANTUM_REFRESH_TOKEN`) in
+`.env`. RS256 service-account signing is outside the stdlib, so the
+adapter uses the OAuth refresh-token flow instead.
+
+`POST /v1/google/jobs` takes `{"backend", "shots", "params"}` where
+`params` carries `program_code` (serialized circuit text); `shots` maps
+to the job's repetitions. The adapter creates the program, then the job
+against it.
+
+Safety gates:
+
+- backend must be in the `GOOGLE_QUANTUM_PROCESSORS` allowlist —
+  **empty by default: submit refuses everything until named**
+- `1 <= shots <= GOOGLE_QUANTUM_MAX_REPETITIONS` (default 1024)
+- **no quota gate**: Quantum Engine exposes no general quota endpoint
+  (only reservation budgets). The operator's explicit approval is the
+  gate — the hub never submits to Google hardware on its own.
+- every submission is appended to `data/google_qpu_ledger.json`
+- REST paths follow the v1alpha1 proto's REST transcoding but are
+  offline-unverified; the `repetitions` wire placement is flagged for
+  live verification before any submit is trusted
+
+Provider selection is explicit per URL (`/v1/qpu`, `/v1/azure`,
+`/v1/google`): there is no default provider and no cross-provider
+fallback, so a request can never default-submit to hardware it didn't
+name.
+
 ## Adding a provider
 
 New provider API → new hub adapter, not a one-off client. Pattern:
@@ -138,7 +195,9 @@ New provider API → new hub adapter, not a one-off client. Pattern:
   to a network without adding some.
 - `stream: true` is rejected in v1; non-streaming only.
 - Keys are never logged. Provider errors are sanitized before returning.
-- Tests: `python3 tests/test_hub.py` (118 checks, no network or keys needed).
+- Tests: `python3 tests/test_hub.py` (hub suite) and
+  `python3 tests/test_adapters.py` (Azure/Google adapter suite) — no network
+  or keys needed.
 - The hub is a separate service from the Medic Bridge relay; they run side
   by side and don't depend on each other.
 
