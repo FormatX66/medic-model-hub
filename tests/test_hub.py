@@ -10,6 +10,8 @@ import urllib.error
 sys.path.insert(0, "server")
 import hub
 import qpu
+import azure_quantum
+import google_quantum
 
 PASS, FAIL = 0, 0
 
@@ -358,6 +360,67 @@ finally:
     qpu._token, qpu._token_at = None, 0.0
     qpu.API_KEY = ""
 
+# --- qpu curl transport (offline; stubbed subprocess) -----------------------
+print("qpu curl transport:")
+import shutil as _shutil
+
+if _shutil.which("curl"):
+    _real_client = qpu.HTTP_CLIENT
+    qpu.HTTP_CLIENT = "curl"
+    _real_run = qpu.subprocess.run
+
+    class _FakeProc:
+        def __init__(self, out):
+            self.stdout = out.encode()
+
+    try:
+        # unreachable host -> (0, ...), never raises
+        st, body = qpu._http("GET", "https://example.invalid/api/v1/backends",
+                             bearer="tok123", timeout=5)
+        check("qpu curl unreachable -> (0, ...), never raises",
+              st == 0 and isinstance(body, dict))
+        check("qpu curl transport wraps provider_error",
+              "provider_error" in body)
+
+        # error-status contract matches urllib path
+        qpu.subprocess.run = lambda *a, **k: _FakeProc('{"error": "banned"}\n403')
+        st, body = qpu._curl_http("GET", "https://example.invalid/",
+                                  {"Accept": "application/json"}, None, 5)
+        check("qpu curl maps HTTP>=400 to provider_error",
+              st == 403 and body == {"provider_error": {"error": "banned"}})
+
+        # 200 passes the body through; headers reach the curl argv
+        _seen = {}
+
+        def _fake_run(cmd, **k):
+            _seen["cmd"] = cmd
+            return _FakeProc('{"ok": true}\n200')
+
+        qpu.subprocess.run = _fake_run
+        st, body = qpu._http("GET", "https://example.invalid/x",
+                             bearer="tok123", timeout=5)
+        flat = " ".join(_seen["cmd"])
+        check("qpu curl 200 passes body through",
+              st == 200 and body == {"ok": True})
+        check("qpu curl sends bearer header",
+              "Authorization: Bearer tok123" in flat)
+        check("qpu curl sends hub User-Agent",
+              f"User-Agent: {qpu.USER_AGENT}" in flat)
+    finally:
+        qpu.subprocess.run = _real_run
+        qpu.HTTP_CLIENT = _real_client
+
+    # curl binary missing -> _curl_http returns None (urllib fallback)
+    _real_which = qpu.shutil.which
+    qpu.shutil.which = lambda *a, **k: None
+    try:
+        check("qpu curl missing -> None (urllib fallback)",
+              qpu._curl_http("GET", "https://example.invalid/", {}, None, 5) is None)
+    finally:
+        qpu.shutil.which = _real_which
+else:
+    print("  (curl not installed; curl-transport tests skipped)")
+
 # --- websearch module (Brave + DuckDuckGo, stubbed HTTP) -------------------
 print("websearch:")
 import websearch as ws
@@ -573,6 +636,271 @@ check("GET /v1/qpu unknown job -> 502 sanitized", st == 502 and "detail" in b)
 
 st, b = req2("GET", "/v1/qpu/nope")
 check("GET /v1/qpu unknown path 404", st == 404)
+
+# --- Azure + Google wiring tests (stubbed provider APIs, no network) ----
+print("azure/google wiring:")
+
+# unconfigured HTTP surface (no creds in env)
+st, b = req2("GET", "/v1/azure")
+check("GET /v1/azure index", st == 200 and "GET /v1/azure/backends" in b["endpoints"]
+      and b["configured"] is False)
+st, b = req2("GET", "/v1/google")
+check("GET /v1/google index", st == 200 and "GET /v1/google/backends" in b["endpoints"]
+      and b["configured"] is False)
+st, b = req2("GET", "/v1/azure/backends")
+check("azure unconfigured -> 400", st == 400 and "not configured" in b["error"])
+st, b = req2("GET", "/v1/google/usage")
+check("google unconfigured -> 400", st == 400 and "not configured" in b["error"])
+st, b = req2("GET", "/health")
+check("health reports azure_qpu/google_qpu flags",
+      st == 200 and b["backends"]["azure_qpu"] is False
+      and b["backends"]["google_qpu"] is False)
+st, b = req2("GET", "/v1/aws/backends")
+check("unknown provider root 404", st == 404)
+
+# Azure adapter, stubbed at the _authed boundary
+azure_quantum.SUBSCRIPTION_ID, azure_quantum.RESOURCE_GROUP = "sub1", "rg1"
+azure_quantum.WORKSPACE, azure_quantum.TENANT_ID = "ws1", "ten1"
+azure_quantum.CLIENT_ID, azure_quantum.CLIENT_SECRET = "cid", "csec"
+azure_quantum._CONN = {"quantumendpoint": "https://eastus.quantum.azure.com"}
+azure_quantum.TARGETS = ["ionq.simulator"]
+azure_quantum.MAX_SHOTS = 1024
+azure_quantum.LEDGER_PATH = _os.path.join(tempfile.mkdtemp(), "azure_ledger.json")
+
+az_calls = []
+
+
+def fake_az_authed(method, url, payload=None, timeout=60, **kw):
+    az_calls.append((method, url, payload))
+    if url.endswith("/quotas?api-version=" + azure_quantum.API_VERSION):
+        return 200, {"quotas": [{"providerId": "ionq",
+                                 "dimension": {"name": "q"},
+                                 "utilization": 10, "limit": 100,
+                                 "period": "PT1H", "scope": "ws"}]}, None
+    if "/providers?api-version=" in url:
+        return 200, {"providers": [{"providerId": "ionq",
+                                    "targets": [{"id": "ionq.simulator",
+                                                 "currentAvailability": "Available"}]}]}, None
+    if method == "PUT" and "/jobs/" in url:
+        return 200, {"status": "Waiting"}, None
+    if url.endswith("/jobs/jobA?api-version=" + azure_quantum.API_VERSION):
+        return 200, {"id": "jobA", "status": "Succeeded"}, None
+    return 404, None, {"provider_error": {"message": "nope"}}
+
+
+_orig_az_authed = azure_quantum._authed
+_orig_az_upload = azure_quantum._upload_input_blob
+azure_quantum._authed = fake_az_authed
+azure_quantum._upload_input_blob = lambda *a, **k: (True, None)
+
+s, r, e = azure_quantum.backends()
+check("azure backends slim", s == 200 and r["backends"][0]["target"] == "ionq.simulator"
+      and r["backends"][0]["provider"] == "ionq")
+
+s, r, e = azure_quantum.usage()
+check("azure usage slim", s == 200 and r["quotas"][0]["provider"] == "ionq"
+      and r["quotas"][0]["limit"] == 100)
+
+az_params = {"input_data": "{}", "input_data_format": "ionq.circuit.v1",
+             "container_sas_uri": "https://blob.example/c?sig=x"}
+s, r, e = azure_quantum.submit_job("ionq.simulator", 64, az_params)
+check("azure submit ok", s == 200 and r["shots"] == 64
+      and r["backend"] == "ionq.simulator")
+with open(azure_quantum.LEDGER_PATH, encoding="utf-8") as f:
+    az_ledger = json.load(f)
+check("azure ledger appended",
+      isinstance(az_ledger, list) and az_ledger[-1]["shots"] == 64
+      and az_ledger[-1]["backend"] == "ionq.simulator")
+
+s, r, e = azure_quantum.submit_job("quantinuum.qpu", 64, az_params)
+check("azure allowlist enforced", s == 400 and "allowlist" in e["error"])
+
+s, r, e = azure_quantum.submit_job("ionq.simulator", 99999, az_params)
+check("azure shot cap enforced", s == 400 and "1024" in e["error"])
+
+azure_quantum.TARGETS = []
+s, r, e = azure_quantum.submit_job("ionq.simulator", 64, az_params)
+check("azure empty allowlist refuses", s == 400 and "allowlist" in e["error"])
+azure_quantum.TARGETS = ["ionq.simulator"]
+
+s, r, e = azure_quantum.submit_job("ionq.simulator", 64, {"input_data": "{}"})
+check("azure params shape enforced", s == 400 and "container_sas_uri" in e["error"])
+
+
+def fake_az_quota(method, url, payload=None, timeout=60, **kw):
+    if "/quotas" in url:
+        return 200, {"quotas": [{"providerId": "ionq", "utilization": 100,
+                                 "limit": 100, "period": "PT1H",
+                                 "dimension": {"name": "q"}, "scope": "ws"}]}, None
+    return fake_az_authed(method, url, payload, timeout, **kw)
+
+
+azure_quantum._authed = fake_az_quota
+n_before = len(az_calls)
+s, r, e = azure_quantum.submit_job("ionq.simulator", 64, az_params)
+check("azure quota gate refuses submit",
+      s == 400 and "exhausted" in e["error"]
+      and all("/jobs/" not in c[1] or c[0] != "PUT" for c in az_calls[n_before:]))
+azure_quantum._authed = fake_az_authed
+
+# Azure through the real HTTP layer (provider API still stubbed)
+st, b = req2("GET", "/v1/azure")
+check("GET /v1/azure index configured", st == 200 and b["configured"] is True)
+
+st, b = req2("GET", "/v1/azure/backends")
+check("GET /v1/azure/backends", st == 200 and b["backends"][0]["target"] == "ionq.simulator")
+
+st, b = req2("GET", "/v1/azure/usage")
+check("GET /v1/azure/usage", st == 200 and b["quotas"][0]["provider"] == "ionq")
+
+st, b = req2("POST", "/v1/azure/jobs",
+             {"backend": "ionq.simulator", "shots": 64, "params": az_params})
+check("POST /v1/azure/jobs", st == 200 and b["shots"] == 64)
+
+st, b = req2("POST", "/v1/azure/jobs",
+             {"backend": "ionq.simulator", "shots": 64})
+check("POST /v1/azure/jobs missing params 400", st == 400)
+
+st, b = req2("POST", "/v1/azure/jobs",
+             {"backend": "ionq.simulator", "shots": 99999, "params": az_params})
+check("POST /v1/azure/jobs over cap 400", st == 400 and "shots" in b["error"])
+
+st, b = req2("GET", "/v1/azure/jobs/jobA")
+check("GET /v1/azure/jobs/{id}", st == 200 and b["status"] == "Succeeded")
+
+st, b = req2("GET", "/v1/azure/jobs/jobA/results")
+check("GET /v1/azure/jobs/{id}/results", st == 200 and b["blobs"] == {})
+
+st, b = req2("POST", "/v1/azure/jobs/jobA/cancel", {})
+check("POST /v1/azure/jobs/{id}/cancel -> 502 sanitized", st == 502 and "detail" in b)
+
+st, b = req2("GET", "/v1/azure/nope")
+check("GET /v1/azure unknown path 404", st == 404)
+
+# Google adapter, stubbed at the _authed boundary
+google_quantum.PROJECT_ID = "proj1"
+google_quantum.ACCESS_TOKEN = "tok"
+google_quantum.PROCESSORS = ["sycamore_weber"]
+google_quantum.MAX_REPS = 1024
+google_quantum.LEDGER_PATH = _os.path.join(tempfile.mkdtemp(), "google_ledger.json")
+
+gq_calls = []
+
+
+def fake_gq_authed(method, path, payload=None, timeout=60):
+    gq_calls.append((method, path, payload))
+    if method == "GET" and path == "/projects/proj1/processors":
+        return 200, {"processors": [
+            {"name": "projects/proj1/processors/sycamore_weber",
+             "health": "OK"}]}, None
+    if method == "GET" and path == "/projects/proj1/reservationBudgets":
+        return 200, {"reservationBudgets": []}, None
+    if method == "POST" and path == "/projects/proj1/programs":
+        return 200, {"name": "projects/proj1/programs/prog1"}, None
+    if method == "POST" and path == "/projects/proj1/jobs":
+        return 200, {"name": "projects/proj1/jobs/job9",
+                     "executionStatus": {"state": "READY"}}, None
+    if method == "GET" and path == "/projects/proj1/jobs/job9/result":
+        return 200, {"result": "raw"}, None
+    if method == "GET" and path == "/projects/proj1/jobs/job9":
+        return 200, {"name": "projects/proj1/jobs/job9",
+                     "executionStatus": {"state": "SUCCESS"}}, None
+    if method == "POST" and path == "/projects/proj1/jobs/job9:cancel":
+        return 200, {}, None
+    return 404, None, {"provider_error": {"message": "nope"}}
+
+
+_orig_gq_authed = google_quantum._authed
+google_quantum._authed = fake_gq_authed
+
+s, r, e = google_quantum.backends()
+check("google backends slim", s == 200 and r["backends"][0]["id"] == "sycamore_weber"
+      and r["backends"][0]["health"] == "OK")
+
+s, r, e = google_quantum.usage()
+check("google usage budgets", s == 200 and r["budgets"] == [] and "note" in r)
+
+gq_calls.clear()
+s, r, e = google_quantum.submit_job("sycamore_weber", 128,
+                                    {"program_code": "OPENQASM 2.0;"})
+check("google submit ok", s == 200 and r["repetitions"] == 128
+      and r["job_id"] == "job9")
+check("google submit created program first",
+      gq_calls[0][1] == "/projects/proj1/programs")
+check("google submit repetitions in job body", gq_calls[1][2]["repetitions"] == 128)
+check("google submit processor in job body",
+      gq_calls[1][2]["processor"]["name"].endswith("/processors/sycamore_weber"))
+with open(google_quantum.LEDGER_PATH, encoding="utf-8") as f:
+    gq_ledger = json.load(f)
+check("google ledger appended",
+      isinstance(gq_ledger, list) and gq_ledger[-1]["repetitions"] == 128
+      and gq_ledger[-1]["backend"] == "sycamore_weber")
+
+s, r, e = google_quantum.submit_job("sycamore_zzz", 128, {"program_code": "x"})
+check("google allowlist enforced", s == 400 and "allowlist" in e["error"])
+
+google_quantum.PROCESSORS = []
+s, r, e = google_quantum.submit_job("sycamore_weber", 128, {"program_code": "x"})
+check("google empty allowlist refuses", s == 400 and "allowlist" in e["error"])
+google_quantum.PROCESSORS = ["sycamore_weber"]
+
+s, r, e = google_quantum.submit_job("sycamore_weber", 99999, {"program_code": "x"})
+check("google rep cap enforced", s == 400 and "1024" in e["error"])
+
+s, r, e = google_quantum.submit_job("sycamore_weber", 128, {})
+check("google program_code required", s == 400 and "program_code" in e["error"])
+
+s, r, e = google_quantum.job_get("job9")
+check("google job_get", s == 200 and r["name"].endswith("/jobs/job9"))
+
+s, r, e = google_quantum.job_results("job9")
+check("google job_results raw", s == 200 and r["result"] == "raw")
+
+s, r, e = google_quantum.job_cancel("job9")
+check("google job_cancel", s == 200)
+
+# Google through the real HTTP layer (provider API still stubbed)
+st, b = req2("GET", "/v1/google")
+check("GET /v1/google index configured", st == 200 and b["configured"] is True)
+
+st, b = req2("GET", "/v1/google/backends")
+check("GET /v1/google/backends", st == 200 and b["backends"][0]["id"] == "sycamore_weber")
+
+st, b = req2("GET", "/v1/google/usage")
+check("GET /v1/google/usage", st == 200 and b["budgets"] == [])
+
+st, b = req2("POST", "/v1/google/jobs",
+             {"backend": "sycamore_weber", "shots": 128,
+              "params": {"program_code": "OPENQASM 2.0;"}})
+check("POST /v1/google/jobs", st == 200 and b["repetitions"] == 128)
+
+st, b = req2("GET", "/v1/google/jobs/job9")
+check("GET /v1/google/jobs/{id}", st == 200)
+
+st, b = req2("GET", "/v1/google/jobs/job9/results")
+check("GET /v1/google/jobs/{id}/results", st == 200 and b["result"] == "raw")
+
+st, b = req2("POST", "/v1/google/jobs/job9/cancel", {})
+check("POST /v1/google/jobs/{id}/cancel", st == 200)
+
+st, b = req2("GET", "/v1/google/nope")
+check("GET /v1/google unknown path 404", st == 404)
+
+# IBM surface is untouched by the new providers
+st, b = req2("GET", "/v1/qpu")
+check("IBM index unchanged", st == 200 and "GET /v1/qpu/backends" in b["endpoints"])
+
+# restore monkeypatches and unconfigure new providers
+azure_quantum._authed = _orig_az_authed
+azure_quantum._upload_input_blob = _orig_az_upload
+google_quantum._authed = _orig_gq_authed
+azure_quantum.SUBSCRIPTION_ID = azure_quantum.RESOURCE_GROUP = ""
+azure_quantum.WORKSPACE = azure_quantum.TENANT_ID = ""
+azure_quantum.CLIENT_ID = azure_quantum.CLIENT_SECRET = ""
+azure_quantum.TARGETS = []
+google_quantum.PROJECT_ID = ""
+google_quantum.ACCESS_TOKEN = ""
+google_quantum.PROCESSORS = []
 
 qpu.API_KEY = ""
 st, b = req2("GET", "/v1/qpu/backends")
