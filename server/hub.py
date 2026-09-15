@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Medic Model Hub v1.2.2 — one OpenAI-compatible API for every model.
+"""Medic Model Hub v1.2.3 — one OpenAI-compatible API for every model.
 
 POST /v1/chat/completions with {"model": ..., "messages": [...]} and the hub
 routes to the right provider behind the scenes. Keys live in one local .env
@@ -8,7 +8,10 @@ that builds never touch.
 Chat backends: openai, anthropic, google (gemini), perplexity (sonar, via
 Perplexity's Agent API). POST /v1/embeddings routes to OpenAI's embedding
 models for semantic search. GET/POST /v1/qpu/* is the IBM Quantum gateway
-(backends, usage, job submit/poll/results/cancel) with hardware safety gates.
+(backends, usage, job submit/poll/results/cancel) with hardware safety gates;
+`/v1/azure/*` (Azure Quantum) and `/v1/google/*` (Google Quantum Engine)
+mirror it provider-for-provider. Provider selection is explicit per URL —
+requests never default or fall through to another provider's hardware.
 POST /v1/web_search is the hub's own free web search (Brave free tier, or
 keyless DuckDuckGo fallback) — Sonar uses it for grounding by default so no
 Perplexity per-call search fee is incurred. Only configured backends are
@@ -25,9 +28,11 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import qpu
+import azure_quantum
+import google_quantum
 import websearch
 
-VERSION = "1.2.2"
+VERSION = "1.2.4"
 PORT = int(os.environ.get("PORT", "8090"))
 
 # ---------------------------------------------------------------- config ---
@@ -278,6 +283,11 @@ EMBED_ADAPTERS = {"openai": openai_embed}
 
 
 # ---------------------------------------------------------------- server ---
+# provider root -> adapter module. Provider selection is explicit per
+# request URL; there is no default provider and no cross-provider fallback.
+QPU_PROVIDERS = {"qpu": qpu, "azure": azure_quantum, "google": google_quantum}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"medic-model-hub/{VERSION}"
 
@@ -310,6 +320,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             health = configured_backends()
             health["qpu"] = qpu.configured()
+            health["azure_qpu"] = azure_quantum.configured()
+            health["google_qpu"] = google_quantum.configured()
             health["web_search"] = websearch.source()  # 'brave' or 'duckduckgo'
             self._json(200, {"ok": True, "version": VERSION, "backends": health})
         elif path == "/v1/models":
@@ -318,8 +330,11 @@ class Handler(BaseHTTPRequestHandler):
             data += [{"id": m, "object": "model", "owned_by": b}
                      for m, (b, _) in EMBED_ROUTES.items() if BACKEND_KEYS[b]]
             self._json(200, {"object": "list", "data": data})
-        elif path == "/v1/qpu" or path.startswith("/v1/qpu/"):
-            self._qpu("GET", path.split("/")[3:], None)
+        elif path == "/v1/qpu" or path.startswith("/v1/qpu/") \
+                or path == "/v1/azure" or path.startswith("/v1/azure/") \
+                or path == "/v1/google" or path.startswith("/v1/google/"):
+            segs = path.split("/")
+            self._qpu("GET", segs[3:], None, segs[2])
         else:
             self._json(404, {"error": "not found"})
 
@@ -419,36 +434,43 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(502, {"error": msg})
 
-    def _qpu(self, method, parts, body):
-        """Route /v1/qpu/* — the IBM Quantum gateway."""
+    def _qpu(self, method, parts, body, provider):
+        """Route /v1/{qpu,azure,google}/* — the per-provider QPU gateways.
+
+        IBM (/v1/qpu), Azure Quantum (/v1/azure), Google Quantum Engine
+        (/v1/google). Same endpoint shape, same safety model; `provider`
+        comes from the URL, never from a default.
+        """
+        mod = QPU_PROVIDERS[provider]
+        root = f"/v1/{provider}"
         if parts == []:
             self._json(200, {"endpoints": [
-                "GET /v1/qpu/backends", "GET /v1/qpu/usage",
-                "POST /v1/qpu/jobs", "GET /v1/qpu/jobs/{id}",
-                "GET /v1/qpu/jobs/{id}/results", "POST /v1/qpu/jobs/{id}/cancel",
-            ], "configured": qpu.configured()})
+                f"GET {root}/backends", f"GET {root}/usage",
+                f"POST {root}/jobs", f"GET {root}/jobs/{{id}}",
+                f"GET {root}/jobs/{{id}}/results", f"POST {root}/jobs/{{id}}/cancel",
+            ], "configured": mod.configured()})
             return
         if method == "GET" and parts == ["backends"]:
-            self._qpu_out(*qpu.backends())
+            self._qpu_out(*mod.backends())
         elif method == "GET" and parts == ["usage"]:
-            self._qpu_out(*qpu.usage())
+            self._qpu_out(*mod.usage())
         elif method == "POST" and parts == ["jobs"]:
             if not isinstance(body, dict):
                 self._json(400, {"error": "need JSON body with 'backend', 'shots', 'params'"})
                 return
-            print(f"qpu submit backend={body.get('backend')} shots={body.get('shots')}",
+            print(f"{provider} submit backend={body.get('backend')} shots={body.get('shots')}",
                   flush=True)
-            self._qpu_out(*qpu.submit_job(body.get("backend"), body.get("shots"),
+            self._qpu_out(*mod.submit_job(body.get("backend"), body.get("shots"),
                                           body.get("params")))
         elif method == "GET" and len(parts) == 2 and parts[0] == "jobs":
-            self._qpu_out(*qpu.job_get(parts[1]))
+            self._qpu_out(*mod.job_get(parts[1]))
         elif method == "GET" and len(parts) == 3 and parts[0] == "jobs" \
                 and parts[2] == "results":
-            self._qpu_out(*qpu.job_results(parts[1]))
+            self._qpu_out(*mod.job_results(parts[1]))
         elif method == "POST" and len(parts) == 3 and parts[0] == "jobs" \
                 and parts[2] == "cancel":
-            print(f"qpu cancel job={parts[1]}", flush=True)
-            self._qpu_out(*qpu.job_cancel(parts[1]))
+            print(f"{provider} cancel job={parts[1]}", flush=True)
+            self._qpu_out(*mod.job_cancel(parts[1]))
         else:
             self._json(404, {"error": "not found"})
 
@@ -475,12 +497,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path == "/v1/qpu" or path.startswith("/v1/qpu/"):
+        if path == "/v1/qpu" or path.startswith("/v1/qpu/") \
+                or path == "/v1/azure" or path.startswith("/v1/azure/") \
+                or path == "/v1/google" or path.startswith("/v1/google/"):
             body = self._read_json()
             if body is None:
                 self._json(400, {"error": "invalid JSON body"})
                 return
-            self._qpu("POST", path.split("/")[3:], body)
+            segs = path.split("/")
+            self._qpu("POST", segs[3:], body, segs[2])
         elif path == "/v1/chat/completions":
             body = self._read_json()
             if body is None:
